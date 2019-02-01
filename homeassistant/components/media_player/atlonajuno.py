@@ -1,8 +1,7 @@
-"""
-Support for controlling an Atlona Juno 451 HDMI switch.
-
-"""
+import datetime
 import logging
+import time
+import os
 
 import voluptuous as vol
 
@@ -29,6 +28,35 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
 
 
 SUPPORT_AtlonaJuno = SUPPORT_TURN_ON | SUPPORT_TURN_OFF | SUPPORT_SELECT_SOURCE
+LOCK_FILE = "/var/lock/atlonajuno"
+
+def file_lock(func, timeout=datetime.timedelta(minutes=2)):
+    def wrapper(*args, **kwargs):
+        start = datetime.datetime.now()
+        sleeps = 0
+        while (datetime.datetime.now() < start+timeout):
+            if os.path.exists(LOCK_FILE):
+                time.sleep(1)
+                sleeps += 1
+                continue
+
+            # create lock file
+            open(LOCK_FILE, 'w').close()
+            if sleeps > 0:
+                # we had to wait for another process that had the lock
+                # give the juno a few seconds to reset the telnet daemon
+                # as it has been known to crash if sequential logins
+                # happen too quickly :( 
+                time.sleep(5)
+            try:
+                func(*args, **kwargs)
+            finally:
+                try:
+                    os.remove(LOCK_FILE)
+                except Exception:
+                    _LOGGER.info("failed to remove lockfile {}".format(LOCK_FILE))
+            break
+    return wrapper
 
 
 def setup_platform(hass, config, add_entities, discovery_info=None):
@@ -77,6 +105,7 @@ class AtlonaJunoDevice(MediaPlayerDevice):
         from pyatlonajuno.lib import Juno451
         return Juno451(self._username, self._password, self._host, self._port)
 
+    @file_lock
     def update(self):
         """Get the latest state from the device."""
         pwstate = self.juno.getPowerState()
@@ -111,14 +140,17 @@ class AtlonaJunoDevice(MediaPlayerDevice):
         """Return supported features."""
         return SUPPORT_AtlonaJuno
 
+    @file_lock
     def turn_off(self):
         """Turn hdmi switch off."""
         self.juno.setPowerState("off")
 
+    @file_lock
     def turn_on(self):
         """Turn hdmi switch on."""
         self.juno.setPowerState("on")
 
+    @file_lock
     def select_source(self, source):
         """Set the input source."""
         self.juno.setSource(source)
