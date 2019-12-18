@@ -5,78 +5,42 @@ import os
 
 import voluptuous as vol
 
+from homeassistant.components.media_player.const import (
+    SUPPORT_SELECT_SOURCE, SUPPORT_TURN_OFF, SUPPORT_TURN_ON)
 from homeassistant.components.media_player import (
-    PLATFORM_SCHEMA, SUPPORT_SELECT_SOURCE, SUPPORT_TURN_OFF, SUPPORT_TURN_ON,
-    MediaPlayerDevice)
+    MediaPlayerDevice, PLATFORM_SCHEMA)
+#from homeassistant.helpers.config_validation import PLATFORM_SCHEMA
 from homeassistant.const import (
-    CONF_HOST, CONF_NAME, CONF_USERNAME, CONF_PASSWORD, CONF_PORT, STATE_OFF, STATE_ON)
+    CONF_URL, CONF_NAME, STATE_OFF, STATE_ON)
 import homeassistant.helpers.config_validation as cv
 
 REQUIREMENTS = ['pyatlonajuno==0.1.2']
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_PORT = 23
-
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_HOST): cv.string,
-    vol.Required(CONF_USERNAME): cv.string,
-    vol.Required(CONF_PASSWORD): cv.string,
-    vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
+    vol.Required(CONF_URL): cv.string,
     vol.Optional(CONF_NAME, default="atlonajuno"): cv.string,
 })
 
 
 SUPPORT_AtlonaJuno = SUPPORT_TURN_ON | SUPPORT_TURN_OFF | SUPPORT_SELECT_SOURCE
-LOCK_FILE = "/var/lock/atlonajuno"
-
-def file_lock(func, timeout=datetime.timedelta(minutes=2)):
-    def wrapper(*args, **kwargs):
-        start = datetime.datetime.now()
-        sleeps = 0
-        while (datetime.datetime.now() < start+timeout):
-            if os.path.exists(LOCK_FILE):
-                time.sleep(1)
-                sleeps += 1
-                continue
-
-            # create lock file
-            open(LOCK_FILE, 'w').close()
-            if sleeps > 0:
-                # we had to wait for another process that had the lock
-                # give the juno a few seconds to reset the telnet daemon
-                # as it has been known to crash if sequential logins
-                # happen too quickly :( 
-                time.sleep(5)
-            try:
-                func(*args, **kwargs)
-            finally:
-                try:
-                    os.remove(LOCK_FILE)
-                except Exception:
-                    _LOGGER.info("failed to remove lockfile {}".format(LOCK_FILE))
-            break
-    return wrapper
 
 
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the Atlona Juno platform."""
-    host = config.get(CONF_HOST)
-    port = config.get(CONF_PORT)
-    username = config.get(CONF_USERNAME)
-    password = config.get(CONF_PASSWORD)
+    url = config.get(CONF_URL)
     name = config.get(CONF_NAME)
 
     if 'atlonajuno' not in hass.data:
         hass.data['atlonajuno'] = {}
     hass_data = hass.data['atlonajuno']
 
-    device_label = "{}:{}".format(host, port)
-    if device_label in hass_data:
+    if url in hass_data:
         return
 
-    device = AtlonaJunoDevice(username, password, host, port, name)
-    hass_data[device_label] = device
+    device = AtlonaJunoDevice(url, name, hass)
+    hass_data[url] = device
     add_entities([device], True)
 
 
@@ -88,24 +52,32 @@ def format_input_source(input_source_name, input_source_number):
 class AtlonaJunoDevice(MediaPlayerDevice):
     """Representation of a AtlonaJuno device."""
 
-    def __init__(self, username, password, host, port, name):
+    def __init__(self, url, name, hass):
         """Iinitialize the AtlonaJuno device."""
-        self._username = username
-        self._password = password
-        self._host = host
-        self._port = port
+        self._url = url
         self._name = name
+        self._hass = hass
         self._pwstate = STATE_OFF
         self._current_source = None
         self._source_list = [1,2,3,4]
+        self._signal_detected = False
+        self._signal_detected_raw = False
+        self.signal_state_change_ts = datetime.datetime.now() - datetime.timedelta(minutes=2)
         self.juno = self.create_juno()
+        self._signal_loss_count = 0
 
     def create_juno(self):
         """Create Juno451 Instance."""
         from pyatlonajuno.lib import Juno451
-        return Juno451(self._username, self._password, self._host, self._port)
+        return Juno451(self._url)
 
-    @file_lock
+    @property
+    def device_state_attributes(self):
+        """Return the state attributes of the sensor."""
+        return dict(
+            signal_detected=self._signal_detected_raw
+        )
+
     def update(self):
         """Get the latest state from the device."""
         pwstate = self.juno.getPowerState()
@@ -113,6 +85,48 @@ class AtlonaJunoDevice(MediaPlayerDevice):
             self._pwstate = STATE_OFF
         else:
             self._pwstate = STATE_ON
+
+            # The events fired here are mostly obsolete, as signal_detected
+            # is now exposed as an entity attribute.
+
+            # When power is on, we can detect if the currently selected
+            # input is supplying a signal. A HASS event is fired
+            # when signal is gained/lost so that automations can react
+            # to sources being switched on/off. Signal loss events
+            # are fired after consecutive loss readings to prevent
+            # false events during source mode swithces.
+
+            signal_detected = self.juno.getSignalDetected()
+            self._signal_detected_raw = signal_detected
+
+            # Reset signal lost count if signal is detected
+            # 3 consecutive no signal readings are required to trigger
+            # projector off, this prevents the projector being killed
+            # during mode switching.
+            if signal_detected == True:
+                self._signal_loss_count = 0
+
+            time_since_last_state_change = datetime.datetime.now() - self.signal_state_change_ts
+            recently_switched = time_since_last_state_change < datetime.timedelta(minutes=1)
+
+            if signal_detected != self._signal_detected:
+                # new state is different to previous state
+                # signal gained/lost
+
+                if signal_detected == True:
+                    # signal gained --> switch on immediately
+                    self._signal_detected = True
+                    self._hass.bus.fire('atlona_juno_signal_detected', {})
+                else:
+                    if not recently_switched:
+                        # signal lost --> wait for 3 consecutive samples
+                        # before firing event
+                        self._signal_loss_count += 1
+                        if self._signal_loss_count >= 3:
+                            self._signal_detected = False
+                            self._hass.bus.fire('atlona_juno_signal_lost', {})
+
+
         self._current_source = self.juno.getSource()
 
     @property
@@ -129,7 +143,7 @@ class AtlonaJunoDevice(MediaPlayerDevice):
     def source(self):
         """Return current input source."""
         return self._current_source
-    
+
     @property
     def source_list(self):
         """Return all available input sources."""
@@ -140,17 +154,14 @@ class AtlonaJunoDevice(MediaPlayerDevice):
         """Return supported features."""
         return SUPPORT_AtlonaJuno
 
-    @file_lock
     def turn_off(self):
         """Turn hdmi switch off."""
         self.juno.setPowerState("off")
 
-    @file_lock
     def turn_on(self):
         """Turn hdmi switch on."""
         self.juno.setPowerState("on")
 
-    @file_lock
     def select_source(self, source):
         """Set the input source."""
         self.juno.setSource(source)
