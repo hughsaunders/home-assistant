@@ -5,12 +5,7 @@ import logging
 
 from httplib2 import ServerNotFoundError  # pylint: disable=import-error
 
-from homeassistant.components.calendar import (
-    ENTITY_ID_FORMAT,
-    CalendarEventDevice,
-    calculate_offset,
-    is_offset_reached,
-)
+from homeassistant.components.calendar import ENTITY_ID_FORMAT, CalendarEventDevice
 from homeassistant.helpers.entity import generate_entity_id
 from homeassistant.util import Throttle, dt
 
@@ -21,10 +16,8 @@ from . import (
     CONF_IGNORE_AVAILABILITY,
     CONF_MAX_RESULTS,
     CONF_NAME,
-    CONF_OFFSET,
     CONF_SEARCH,
     CONF_TRACK,
-    DEFAULT_CONF_OFFSET,
     TOKEN_FILE,
     GoogleCalendarService,
 )
@@ -78,7 +71,7 @@ class GoogleCalendarEventDevice(CalendarEventDevice):
         )
         self._event = None
         self._name = data[CONF_NAME]
-        self._offset = data.get(CONF_OFFSET, DEFAULT_CONF_OFFSET)
+        self._offset = 0
         self._offset_reached = False
         self.entity_id = entity_id
 
@@ -108,8 +101,9 @@ class GoogleCalendarEventDevice(CalendarEventDevice):
         if event is None:
             self._event = event
             return
-        event = calculate_offset(event, self._offset)
-        self._offset_reached = is_offset_reached(event)
+        self._offset_reached = dt.now() > (
+            event["start"]["dateTime"] - timedelta(minutes=self.data.offset)
+        )
         self._event = event
 
 
@@ -126,6 +120,7 @@ class GoogleCalendarData:
         self.ignore_availability = ignore_availability
         self.max_results = max_results
         self.event = None
+        self.offset = 0
 
     def _prepare_query(self):
         try:
@@ -174,6 +169,12 @@ class GoogleCalendarData:
         events = service.events()
         result = events.list(**params).execute()
 
+        default_reminders = result.get("defaultReminders")
+        if default_reminders:
+            default_offset = max(int(r["minutes"]) for r in default_reminders)
+        else:
+            default_offset = 0
+
         items = result.get("items", [])
 
         new_event = None
@@ -185,5 +186,13 @@ class GoogleCalendarData:
             else:
                 new_event = item
                 break
+
+        reminders = new_event["reminders"]
+        if reminders["useDefault"]:
+            self.offset = default_offset
+        elif reminders["overrides"]:
+            self.offset = max(int(r["minutes"]) for r in reminders)
+        else:
+            self.offset = 0
 
         self.event = new_event
